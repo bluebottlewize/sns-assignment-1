@@ -81,6 +81,14 @@ def main():
     try:
         res = server_sessions[c1_id].process_incoming(m1_r1)
         assert res["data"] == 10
+
+        # Server Finalizes and generates broadcast messages
+        # Each client gets the SAME sum, but encrypted with THEIR specific S2C keys
+        aggr_msg_r1 = server_sessions[c1_id].make_aggr_response(res["data"])
+
+        # Clients process the aggregate result
+        client1.process_incoming(aggr_msg_r1)
+
         print_ok("Round 1 Data verified. Keys evolved correctly across the aggregate.")
     except Exception as e:
         print(f"[FAIL] Round 1 failed. Likely a key evolution mismatch: {e}")
@@ -89,8 +97,8 @@ def main():
     # =========================
     # 5. Final Checks
     # =========================
-    assert client1.round == 1  # Client1 just sent Round 1, but hasn't received Round 1 response yet
-    assert server_sessions[c1_id].round == 1  # Server is at Round 1 (waiting for aggregation to finish)
+    assert client1.round == 2  # Client1 just sent Round 1, but hasn't received Round 1 response yet
+    assert server_sessions[c1_id].round == 2  # Server is at Round 1 (waiting for aggregation to finish)
 
     print("\nPROPER MULTI-CLIENT AGGREGATION TEST PASSED ✔️")
 
