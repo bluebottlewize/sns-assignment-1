@@ -14,12 +14,13 @@ This project implements a secure multi-client communication protocol with the fo
 ```
 sns-assignment-1/
 ├── crypto_utils.py          # Phase 1: Cryptographic primitives
-├── protocol_fsm.py           # Phase 2: Protocol state machine
-├── server.py                 # Phase 3: Multi-threaded server
-├── client.py                 # Phase 3: Client implementation
-├── .env                      # Pre-shared master keys
+├── protocol_fsm.py          # Phase 2: Protocol state machine
+├── server.py                # Phase 3: Multi-threaded server
+├── client.py                # Phase 3: Client implementation
+├── .env                     # Pre-shared master keys
 ├── test_comms.py            # Communication tests
 ├── test_protocol_fsm.py     # Protocol tests
+├── SECURITY.md              # Shows why the attacks fail
 └── README.md                # This file
 ```
 
@@ -45,19 +46,11 @@ python -c "from Crypto.Cipher import AES; print('PyCryptodome installed successf
 
 The `.env` file contains pre-shared symmetric master keys (32 bytes / 256 bits each) for each client:
 
-```env
-CLIENT_1_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-CLIENT_2_KEY=fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210
-CLIENT_3_KEY=1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff
-```
-
-**Note:** These keys are loaded automatically by both server and clients. Each client must have a matching key configured.
-
 ## Running the System
 
 ### Step 1: Start the Server
 
-Open a PowerShell terminal and run:
+Open a terminal and run:
 
 ```powershell
 python server.py
@@ -129,28 +122,6 @@ python client.py 3
 2. Type a message and press Enter
 3. The client encrypts and sends the message to the server
 
-**Example:**
-
-**Client 1:**
-```
-> Hello from Client 1
-[+] Sending message for Round 0...
-[+] Message sent (103 bytes)
-```
-
-**Client 2:**
-```
-> Hello from Client 2
-[+] Sending message for Round 0...
-[+] Message sent (103 bytes)
-```
-
-**Client 3:**
-```
-> Hello from Client 3
-[+] Sending message for Round 0...
-[+] Message sent (103 bytes)
-```
 
 ### Server Aggregation
 
@@ -222,51 +193,6 @@ new_key = MD5(old_key)        # For HMAC
 
 This ensures forward secrecy - compromising current keys doesn't expose past communications.
 
-## Troubleshooting
-
-### "Error: .env file not found"
-- Ensure `.env` exists in the project directory
-- Check that you're running from the correct directory
-
-### "Error: CLIENT_X_KEY not found in .env file"
-- Verify the client ID matches an entry in `.env`
-- Check the key format (must be 64 hexadecimal characters)
-
-### Server doesn't respond
-- Ensure server is running before starting clients
-- Check that port 9999 is not blocked by firewall
-- Verify all 3 clients are sending messages for the same round
-
-### Connection refused
-- Confirm server is listening on the correct port
-- Check network connectivity
-- Try using `localhost` instead of IP address
-
-## Testing
-
-Run unit tests:
-
-```powershell
-# Test cryptographic utilities
-python -m pytest test_comms.py -v
-
-# Test protocol FSM
-python -m pytest test_protocol_fsm.py -v
-```
-
-## Architecture
-
-### Multi-Threading Model
-
-- **Main Server Thread**: Accepts incoming connections
-- **ClientHandler Threads**: One thread per client connection
-- **AggregationManager**: Thread-safe round buffer management
-
-### Thread Safety
-
-- Each client has isolated `ProtocolSession` state
-- Aggregation uses locks for concurrent access to round buffers
-- No shared state between client handlers
 
 ### Security Features
 
@@ -277,7 +203,7 @@ python -m pytest test_protocol_fsm.py -v
 -  Key ratcheting for forward secrecy
 -  Pre-shared keys from secure storage
 
-## Phase 4: Attack Simulation
+## Attack Simulation
 
 ### Running Attack Simulations
 
@@ -293,88 +219,26 @@ The `attacks.py` script demonstrates that the protocol successfully defends agai
 ```
 Threat: Adversary captures and replays a valid encrypted packet
 Defense: Sequential round numbers in FSM reject old packets
-Result: ✅ Server rejects replayed packet (round mismatch)
+Result: Server rejects replayed packet (round mismatch)
 ```
 
 #### 2. Integrity/Bit-Flipping Attack
 ```
 Threat: Adversary modifies ciphertext bits to alter message
 Defense: Encrypt-then-MAC with HMAC-SHA256 detects tampering
-Result: ✅ Server rejects tampered packet (HMAC verification fails)
+Result: Server rejects tampered packet (HMAC verification fails)
 ```
 
 #### 3. Message Reordering Attack
 ```
 Threat: Adversary sends Round 2 data before Round 1
 Defense: FSM enforces strict sequential round numbers
-Result: ✅ Server terminates session (out-of-order round detected)
+Result: Server terminates session (out-of-order round detected)
 ```
 
 #### 4. Key Desynchronization Attack
 ```
 Threat: Block server response to cause key state mismatch
 Defense: Key ratcheting causes HMAC failure on desynced keys
-Result: ✅ Server rejects message (HMAC fails with evolved keys)
+Result: Server rejects message (HMAC fails with evolved keys)
 ```
-
-**Expected Output:**
-```
-╔════════════════════════════════════════════════════════════════════╗
-║               PHASE 4: ATTACK SIMULATION SUITE                     ║
-╚════════════════════════════════════════════════════════════════════╝
-
-[Attacker] Initialized with Client ID 1
-...
-✅ All attacks were successfully detected and mitigated!
-```
-
-### Security Properties Verified
-
-| Property | Mechanism | Attack Mitigated |
-|----------|-----------|------------------|
-| **Authenticity** | HMAC-SHA256 | Bit-flipping, Forgery |
-| **Confidentiality** | AES-128-CBC | Eavesdropping |
-| **Integrity** | Encrypt-then-MAC | Tampering detection before decryption |
-| **Freshness** | Sequential rounds | Replay attacks |
-| **Ordering** | FSM state enforcement | Message reordering |
-| **Forward Secrecy** | Key ratcheting | Key compromise mitigation |
-
-## Team Contributions
-
-- **Phase 1** (crypto_utils.py): Cryptographic primitives
-- **Phase 2** (protocol_fsm.py): Protocol state machine
-- **Phase 3** (server.py, client.py): Network implementation
-- **Phase 4** (attacks.py): Attack simulation and security verification
-
-## Notes
-
-- The default aggregation timeout is **2 seconds**
-- Server runs on **0.0.0.0:9999** (all interfaces)
-- Client IDs must be unique integers (1, 2, 3, ...)
-- The `.env` file should be kept secure (not committed in production)
-
-## Advanced Usage
-
-### Custom Server Port
-
-```powershell
-# Modify server.py line ~463 to change default port
-python server.py
-```
-
-### Connecting to Remote Server
-
-```powershell
-python client.py 1 192.168.1.100 9999
-```
-
-### Adjusting Aggregation Timeout
-
-Modify `server.py` line ~463:
-```python
-server = SecureServer(aggregation_timeout=5.0)  # 5 seconds
-```
-
----
-
-**For questions or issues, contact the development team.**
