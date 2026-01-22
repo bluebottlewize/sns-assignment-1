@@ -394,16 +394,6 @@ class AttackSimulator:
 def main():
     """Run all attack scenarios"""
     print("\n")
-    print("╔" + "═" * 68 + "╗")
-    print("║" + " " * 15 + "PHASE 4: ATTACK SIMULATION SUITE" + " " * 21 + "║")
-    print("╚" + "═" * 68 + "╝")
-    print("\nThis script demonstrates that the protocol successfully defends against:")
-    print("  1. Replay Attacks")
-    print("  2. Integrity/Bit-Flipping Attacks")
-    print("  3. Message Reordering Attacks")
-    print("  4. Key Desynchronization Attacks")
-    print("\n" + "=" * 70)
-    print("NOTE: Server must be running before executing attacks!")
     print("=" * 70 + "\n")
     
     # Use Client ID 1 for all attacks
@@ -430,13 +420,6 @@ def main():
         print("\n" + "=" * 70)
         print("ATTACK SIMULATION COMPLETE")
         print("=" * 70)
-        print("✅ All attacks were successfully detected and mitigated!")
-        print("✅ The protocol demonstrates robust security properties:")
-        print("   - Sequential round numbers prevent replay")
-        print("   - Encrypt-then-MAC detects tampering")
-        print("   - FSM enforces message ordering")
-        print("   - Key evolution detects desynchronization")
-        print("=" * 70 + "\n")
         
     except KeyboardInterrupt:
         print("\n\n[Attacker] Simulation interrupted by user")
