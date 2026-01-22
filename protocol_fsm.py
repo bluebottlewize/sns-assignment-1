@@ -44,6 +44,9 @@ IV_LEN = 16
 def H(data: bytes) -> bytes:
     return hashlib.md5(data).digest()
 
+class DesyncError(Exception):
+    """Triggered when cryptographic or logical synchronization is lost."""
+    pass
 
 # =========================
 # Protocol Session FSM
@@ -79,18 +82,50 @@ class ProtocolSession:
     # =========================
 
     def process_incoming(self, raw: bytes):
+        """
+        Core entry point. Processes raw bytes, handles cryptographic errors,
+        and manages automatic session termination on failure.
+        """
         if self.terminated:
-            raise Exception("Session terminated")
+            return {"response": None, "data": "ERROR_SESSION_TERMINATED"}
 
-        parsed = self._parse_message(raw)
+        try:
+            # 1. Parse the basic structure (Header, IV, Ciphertext, HMAC)
+            parsed = self._parse_message(raw)
 
-        print(parsed)
+            # 2. FAIL-SAFE PEEK:
+            # If the peer is signaling a crash/exit, we process it immediately.
+            # We don't verify HMAC because they likely already wiped their keys.
+            # if parsed["opcode"] in (OP_KEY_DESYNC_ERROR, OP_TERMINATE):
+            #     return self._dispatch(parsed, b"PEER_SIGNALED_EXIT")
 
-        self._verify_header(parsed)
-        self._verify_hmac(parsed)
-        plaintext = self._decrypt(parsed)
+            # 3. Standard Security Checks
+            # These will raise exceptions if the round, ID, or HMAC are wrong.
+            self._verify_header(parsed)
+            self._verify_hmac(parsed)
 
-        return self._dispatch(parsed, plaintext)
+
+            # 4. Decryption
+            # This will raise an exception if padding is invalid (key mismatch)
+            plaintext = self._decrypt(parsed)
+
+            # 5. Logical Dispatch
+            return self._dispatch(parsed, plaintext)
+
+        except DesyncError as e:
+            # Generate the error packet for the peer BEFORE zeroizing
+            error_packet = self.make_desync_error(str(e))
+
+            # Note: make_desync_error calls self._terminate() internally,
+            # so keys are wiped immediately after the packet is built.
+            return {
+                "response": error_packet,
+                "data": f"LOCAL_DESYNC_DETECTION: {e}"
+            }
+        except Exception as e:
+            # Handle other non-desync errors (e.g., protocol violations)
+            self._terminate(str(e))
+            return {"response": None, "data": f"FATAL_ERROR: {e}"}
 
     # =========================
     # Parsing
@@ -126,60 +161,64 @@ class ProtocolSession:
     # =========================
 
     def _verify_header(self, msg):
+        """
+        Checks if the packet metadata matches our internal state machine.
+        """
         # 1. Basic sanity checks (ID, Round, Direction)
         if msg["client_id"] != self.client_id:
-            self._terminate("Client ID mismatch")
+            raise DesyncError("Client ID mismatch")
 
         if msg["round"] != self.round:
-            self._terminate("Round mismatch")
+            raise DesyncError(f"Round mismatch: expected {self.round}, got {msg['round']}")
 
-        if self.role == "server" and msg["direction"] != DIR_C2S:
-            self._terminate("Invalid direction")
-
-        if self.role == "client" and msg["direction"] != DIR_S2C:
-            self._terminate("Invalid direction")
+        # Check directionality
+        expected_dir = DIR_C2S if self.role == "server" else DIR_S2C
+        if msg["direction"] != expected_dir:
+            raise DesyncError("Invalid packet direction")
 
         # 2. Phase-specific Opcode validation
         if self.phase == PHASE_INIT:
-            if self.role == "server":
-                # Server only accepts HELLO to start the session
-                if msg["opcode"] != OP_CLIENT_HELLO:
-                    self._terminate("Invalid opcode in INIT (Server)")
-            else:
-                # Client only accepts CHALLENGE while in INIT
-                if msg["opcode"] != OP_SERVER_CHALLENGE:
-                    self._terminate("Invalid opcode in INIT (Client)")
+            allowed = OP_CLIENT_HELLO if self.role == "server" else OP_SERVER_CHALLENGE
+            if msg["opcode"] != allowed:
+                raise DesyncError(f"Invalid opcode {msg['opcode']} for INIT phase")
 
         elif self.phase == PHASE_ACTIVE:
-            # Once ACTIVE, we only expect Data or Aggregated Responses
-            valid_opcodes = (OP_CLIENT_DATA, OP_SERVER_AGGR_RESPONSE)
-
+            # Include administrative opcodes in the allowed list for ACTIVE phase
+            valid_opcodes = (
+                OP_CLIENT_DATA,
+                OP_SERVER_AGGR_RESPONSE,
+                OP_KEY_DESYNC_ERROR,
+                OP_TERMINATE
+            )
             if msg["opcode"] not in valid_opcodes:
-                self._terminate(f"Invalid opcode {msg['opcode']} in ACTIVE")
+                raise DesyncError(f"Invalid opcode {msg['opcode']} in ACTIVE")
 
         elif self.phase == PHASE_TERMINATED:
-            self._terminate("Session already terminated")
-
+            raise Exception("Session already terminated")
 
     def _verify_hmac(self, msg):
-        mac_key = (
-            self.C2S_Mac if msg["direction"] == DIR_C2S else self.S2C_Mac
-        )
+        """
+        Verifies message integrity. Failure here implies keys have drifted.
+        """
+        mac_key = self.C2S_Mac if msg["direction"] == DIR_C2S else self.S2C_Mac
 
+        # Authenticate the header (including IV) and the ciphertext
         data = msg["header"] + msg["ciphertext"]
 
         if not verify_hmac(mac_key, data, msg["hmac"]):
-            self._terminate("HMAC verification failed")
+            raise DesyncError("HMAC verification failed (Keys desynchronized)")
 
     def _decrypt(self, msg) -> bytes:
-        enc_key = (
-            self.C2S_Enc if msg["direction"] == DIR_C2S else self.S2C_Enc
-        )
+        """
+        Decrypts the payload. Padding errors usually mean the wrong AES key was used.
+        """
+        enc_key = self.C2S_Enc if msg["direction"] == DIR_C2S else self.S2C_Enc
 
         try:
             return aes_cbc_decrypt(msg["ciphertext"], enc_key, msg["iv"])
         except Exception:
-            self._terminate("Invalid padding")
+            # Decryption failure is almost always a desync (wrong key/IV)
+            raise DesyncError("Decryption failed / Invalid padding")
 
     # =========================
     # Update keys
@@ -212,16 +251,22 @@ class ProtocolSession:
         if op == OP_CLIENT_HELLO:
             return self._handle_client_hello(plaintext)
 
-        if op == OP_SERVER_CHALLENGE:
+        elif op == OP_SERVER_CHALLENGE:
             return self._handle_server_challenge(plaintext)
 
-        if op == OP_CLIENT_DATA:
+        elif op == OP_CLIENT_DATA:
             return self._handle_client_data(msg, plaintext)
 
-        if op == OP_SERVER_AGGR_RESPONSE:
+        elif op == OP_SERVER_AGGR_RESPONSE:
             return self._handle_server_response(msg, plaintext)
 
-        self._terminate("Unknown opcode")
+        elif op == OP_KEY_DESYNC_ERROR:
+            return self._handle_desync_error(msg, plaintext)
+
+        elif op == OP_TERMINATE:
+            return self._handle_terminate(msg, plaintext)
+
+        self._terminate(f"Unknown opcode: {op}")
 
     # =========================
     # Handlers
@@ -280,6 +325,36 @@ class ProtocolSession:
             "data": value
         }
 
+    def _handle_desync_error(self, msg, plaintext):
+        """
+        Handles an incoming OP_KEY_DESYNC_ERROR.
+        Even if decryption failed, the dispatcher brings us here via the 'peek' logic.
+        """
+        # Attempt to read the reason if decryption was successful, otherwise indicate desync
+        reason = plaintext.decode('utf-8', errors='ignore') if plaintext else "Crypto Mismatch"
+
+        # We must terminate locally because the peer has already given up on our keys
+        self._terminate(f"Peer reported desynchronization: {reason}")
+
+        return {
+            "response": None,
+            "data": f"TERMINATED_DESYNC: {reason}"
+        }
+
+    def _handle_terminate(self, msg, plaintext):
+        """
+        Handles an incoming OP_TERMINATE signal for a graceful exit.
+        """
+        reason = plaintext.decode('utf-8', errors='ignore') if plaintext else "Graceful Shutdown"
+
+        # Close the session locally
+        self._terminate(f"Peer requested termination: {reason}")
+
+        return {
+            "response": None,
+            "data": f"TERMINATED_GRACEFUL: {reason}"
+        }
+
     # =========================
     # Message Construction
     # =========================
@@ -289,24 +364,40 @@ class ProtocolSession:
         Pure message construction: Encrypts, signs, and frames.
         DOES NOT update state or evolve keys.
         """
+        # 0. Safety Check
+        if self.phase == PHASE_TERMINATED:
+            raise Exception("Cannot send messages from a terminated session")
+
         # 1. State Guard: Verify this opcode is allowed to be SENT right now
         if self.phase == PHASE_INIT:
-            if self.role == "client" and opcode != OP_CLIENT_HELLO:
-                self._terminate(f"Cannot send {opcode} during INIT")
-            if self.role == "server" and opcode != OP_SERVER_CHALLENGE:
-                self._terminate(f"Cannot send {opcode} during INIT")
+            # During INIT, we only allow HELLO (Client) or CHALLENGE (Server)
+            allowed_init = (OP_CLIENT_HELLO, OP_SERVER_CHALLENGE)
+            if opcode not in allowed_init:
+                self._terminate(f"Illegal opcode {opcode} for INIT phase")
+
         elif self.phase == PHASE_ACTIVE:
-            if opcode not in (OP_CLIENT_DATA, OP_SERVER_AGGR_RESPONSE):
+            # During ACTIVE, we allow Data, Aggr Responses, and Admin signals
+            allowed_active = (
+                OP_CLIENT_DATA,
+                OP_SERVER_AGGR_RESPONSE,
+                OP_KEY_DESYNC_ERROR,
+                OP_TERMINATE
+            )
+            if opcode not in allowed_active:
                 self._terminate(f"Illegal opcode {opcode} for ACTIVE phase")
 
         # 2. Cryptographic Prep
         iv = generate_iv()
+        # Determine which key set to use based on direction
         enc_key = self.C2S_Enc if direction == DIR_C2S else self.S2C_Enc
         mac_key = self.C2S_Mac if direction == DIR_C2S else self.S2C_Mac
 
         # 3. Encrypt & Sign
+        # The header is included in the HMAC to prevent tampering with ID/Round/Opcode
         ciphertext, iv = aes_cbc_encrypt(plaintext, enc_key, iv)
         header = struct.pack("!B B I B", opcode, self.client_id, self.round, direction)
+
+        # Sign: Header + IV + Ciphertext
         mac = compute_hmac(mac_key, header + iv + ciphertext)
 
         return header + iv + ciphertext + mac
@@ -351,15 +442,51 @@ class ProtocolSession:
         self.round += 1  # Server completes its round
         return msg_bytes
 
+    def make_desync_error(self, reason: str = "Key Desynchronization"):
+        """
+        Step 5 (Fault): Send Desync Error & Kill Session.
+        Sent when a local crypto/round check fails.
+        """
+        payload = reason.encode('utf-8')
+        direction = DIR_S2C if self.role == "server" else DIR_C2S
+
+        # 1. Build message using current (potentially broken) keys
+        msg_bytes = self._build_message(OP_KEY_DESYNC_ERROR, payload, direction)
+
+        # 2. Immediately kill local session
+        # We do NOT ratchet here; we destroy the state.
+        self._terminate(f"Sent Desync Error: {reason}")
+
+        return msg_bytes
+
+    def make_terminate_msg(self, reason: str = "Graceful Termination"):
+        """
+        Step 6 (Exit): Send Termination & Kill Session.
+        Sent when the application wants to end the session securely.
+        """
+        payload = reason.encode('utf-8')
+        direction = DIR_S2C if self.role == "server" else DIR_C2S
+
+        # 1. Build message using current keys
+        msg_bytes = self._build_message(OP_TERMINATE, payload, direction)
+
+        # 2. Immediately kill local session
+        # This prevents any further messages from being sent or received.
+        self._terminate(f"Sent Termination: {reason}")
+
+        return msg_bytes
+
     # =========================
     # Termination
     # =========================
 
     def _terminate(self, reason):
+        print(f"[!] Session terminating: {reason}")
+
         self.phase = PHASE_TERMINATED
         self.terminated = True
         self._zeroize()
-        raise Exception(f"Session terminated: {reason}")
+        # raise Exception(f"Session terminated: {reason}")
 
     def _zeroize(self):
         self.C2S_Enc = b"\x00" * 32
